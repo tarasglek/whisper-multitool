@@ -52,6 +52,8 @@ def get_extension(filename):
 def extension_for_openai(input_file):
     supported_extensions = ['m4a', 'mp3', 'webm', 'mp4', 'mpga', 'wav', 'mpeg']
     input_extension = get_extension(input_file)
+    if input_extension == "mp4":
+        return "m4a"
     if input_extension not in supported_extensions:
         raise RuntimeError(f"Input file extension {input_extension} not supported by OpenAI API. Supported extensions: {supported_extensions}")
     return input_extension
@@ -60,6 +62,7 @@ def gen_ffmpeg_copy_audio_cmd(input_url_or_file: str, output_file:str, read_inpu
     cmdls = FFMPEG_CMD_PREFIX.strip().split(' ') + [
         "-i",
         input_url_or_file,
+        "-vn",
         "-c",
         "copy",
         "-ss",
@@ -77,6 +80,7 @@ def gen_ffmpeg_copy_audio_cmd_for_openai(input_url_or_file: str, output_file:str
     if extension in audio_extensions_supported_by_openai:
         return gen_ffmpeg_copy_audio_cmd(input_url_or_file, output_file, start_time=start_time, duration=duration)
 
+    # for webm we strip actual video and add dummy tiny video stream
     ext2codec_encoder = {
         'webm': 'libvpx',
     }
@@ -279,7 +283,7 @@ async def loop(params, get_birth_time=default_get_birth_time):
         start_time += chunk_duration_s
         if input_duration and start_time >= input_duration:
             running = False
-            logging.info(f"Reached end of {input_file} after {start_time} seconds")
+            logging.info(f"Successfully transcribed {start_time}/{input_duration} seconds of {input_file}")
         else:
             # overlap transcripts by 1 second to avoid missing words
             start_time -= 1
