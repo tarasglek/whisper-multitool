@@ -7,6 +7,7 @@ ref: https://github.com/ggerganov/whisper.cpp/issues/185
 """
 import asyncio
 import json
+import math
 import os
 import stat
 import subprocess
@@ -15,6 +16,8 @@ import argparse
 import time
 import logging
 from typing import List
+
+OPENAI_CONTENT_LENGTH_LIMIT = 26214400
 
 FFMPEG_CMD_PREFIX = (
     "ffmpeg "
@@ -53,11 +56,30 @@ def extension_for_openai(input_file):
         raise RuntimeError(f"Input file extension {input_extension} not supported by OpenAI API. Supported extensions: {supported_extensions}")
     return input_extension
 
+def gen_ffmpeg_copy_audio_cmd(input_url_or_file: str, output_file:str, read_input_at_native_frame_rate=False, start_time=0, duration=None) -> List[str]:
+    cmdls = FFMPEG_CMD_PREFIX.strip().split(' ') + [
+        "-i",
+        input_url_or_file,
+        "-c",
+        "copy",
+        "-ss",
+        str(start_time),]
+    if read_input_at_native_frame_rate:
+        cmdls += ["-re"]
+    if duration is not None:
+        cmdls += ["-t", str(duration)]
+    cmdls.append(output_file)
+    return cmdls
+
 def gen_ffmpeg_copy_audio_cmd_for_openai(input_url_or_file: str, output_file:str, start_time=0, duration=None) -> List[str]:
+    audio_extensions_supported_by_openai = ['m4a', 'mp3', 'mpga', 'wav']
+    extension = get_extension(output_file)
+    if extension in audio_extensions_supported_by_openai:
+        return gen_ffmpeg_copy_audio_cmd(input_url_or_file, output_file, start_time=start_time, duration=duration)
+
     ext2codec_encoder = {
         'webm': 'libvpx',
     }
-    extension = get_extension(output_file)
     encoder = ext2codec_encoder.get(extension)
     if encoder is None:
         raise RuntimeError(f"Can't find encoder for extension: {extension}")
@@ -83,21 +105,6 @@ def gen_ffmpeg_copy_audio_cmd_for_openai(input_url_or_file: str, output_file:str
         "-ss",
         str(start_time),]
 
-    if duration is not None:
-        cmdls += ["-t", str(duration)]
-    cmdls.append(output_file)
-    return cmdls
-
-def gen_ffmpeg_copy_audio_cmd(input_url_or_file: str, output_file:str, codec:str, read_input_at_native_frame_rate=False, start_time=0, duration=None) -> List[str]:
-    cmdls = FFMPEG_CMD_PREFIX.strip().split(' ') + [
-        "-i",
-        input_url_or_file,
-        "-c",
-        "copy",
-        "-ss",
-        str(start_time),]
-    if read_input_at_native_frame_rate:
-        cmdls += ["-re"]
     if duration is not None:
         cmdls += ["-t", str(duration)]
     cmdls.append(output_file)
@@ -141,7 +148,7 @@ async def run_process_background(cmd, *args):
             logging.error(f"stderr: {stderr.decode().strip()}")
             raise RuntimeError(error_msg)
     return asyncio.create_task(monitor_process()), process
-    
+
 async def default_get_birth_time(file_path):
     loop = asyncio.get_event_loop()
     try:
@@ -168,13 +175,14 @@ async def loop(params, get_birth_time=default_get_birth_time):
     use_openai_api = params.get('use_openai_api')
     follow_stream = params.get('follow_stream')
     tmp_audio_chunk_file = f"/tmp/whisper-live.{extension_for_openai(input_file) if use_openai_api else 'wav'}"
-    step_s = params.get('step_s')
+    chunk_duration_s = params.get('step_s')
     input_duration = 0 if follow_stream else await ffmpeg_get_duration(input_file)
-    if not step_s:
+    if not chunk_duration_s:
         if follow_stream or not use_openai_api:
-            step_s = 30
+            chunk_duration_s = 30
         else:
-            step_s = input_duration
+            chunk_duration_s = input_duration
+
     logging.info(f"json: {json.dumps(params)}")
     start_time = 0
     prompt=""
@@ -196,11 +204,11 @@ async def loop(params, get_birth_time=default_get_birth_time):
                 input_url_or_file=input_file,
                 output_file=tmp_audio_chunk_file,
                 start_time=start_time,
-                duration=step_s))
+                duration=chunk_duration_s))
         else:
             cmd = FFMPEG_CONVERT_TO_WAV_CMD.format(
                 start_time=start_time,
-                duration=step_s,
+                duration=chunk_duration_s,
                 input_file=input_file,
                 output_file=tmp_audio_chunk_file
             )
@@ -208,8 +216,8 @@ async def loop(params, get_birth_time=default_get_birth_time):
             await run_command_unsafe(cmd)
         except subprocess.CalledProcessError as e:
             if e.stderr.decode().strip().endswith("End of file") or start_time == 0:
-                logging.info(f"Waiting {step_s}s for {input_file} file to get more audio...")
-                await asyncio.sleep(step_s)
+                logging.info(f"Waiting {chunk_duration_s}s for {input_file} file to get more audio...")
+                await asyncio.sleep(chunk_duration_s)
                 continue
             else:
                 raise e
@@ -218,13 +226,27 @@ async def loop(params, get_birth_time=default_get_birth_time):
             tmp_duration = await ffmpeg_get_duration(tmp_audio_chunk_file)
             logging.debug(f"Got {tmp_duration} seconds of audio in {tmp_audio_chunk_file}")
         except ValueError:
-            logging.info(f"ffmpeg failed to get duration of {tmp_audio_chunk_file}. Got '{tmp_duration}', assuming {0} seconds...")
+            logging.error(f"ffmpeg failed to get duration of {tmp_audio_chunk_file}")
+            if not follow_stream:
+                raise RuntimeError(f"ffmpeg failed to get duration of {tmp_audio_chunk_file}")
             tmp_duration = 0
 
-        if tmp_duration < step_s:
+        if use_openai_api:
+            file_size = os.path.getsize(tmp_audio_chunk_file)
+            logging.debug(f"Got {file_size} bytes of audio in {tmp_audio_chunk_file}")
+            if file_size > OPENAI_CONTENT_LENGTH_LIMIT:
+                logging.info(f"Audio file {tmp_audio_chunk_file} is larger than limit of {OPENAI_CONTENT_LENGTH_LIMIT} bytes")
+                too_big_ratio = math.ceil(file_size / OPENAI_CONTENT_LENGTH_LIMIT)
+                old_step_s = chunk_duration_s
+                chunk_duration_s = math.floor(chunk_duration_s / too_big_ratio) - 1
+                logging.info(f"Reducing chunk_duration_s from {old_step_s} to {chunk_duration_s} seconds based on file size overshoot")
+                continue
+
+
+        if tmp_duration < chunk_duration_s:
             if follow_stream:
-                logging.info(f"Not enough audio in {input_file} yet. Got {tmp_duration}/{step_s}, waiting {step_s-tmp_duration} seconds...")
-                await asyncio.sleep(step_s - tmp_duration)
+                logging.info(f"Not enough audio in {input_file} yet. Got {tmp_duration}/{chunk_duration_s}, waiting {chunk_duration_s-tmp_duration} seconds...")
+                await asyncio.sleep(chunk_duration_s - tmp_duration)
                 continue
             else:
                 running = False
@@ -250,11 +272,11 @@ async def loop(params, get_birth_time=default_get_birth_time):
             output = await run_command_unsafe(cmd)
             output_file += ".srt"
             if output:
-                yield {"output":output, "srt_file":output_file, "start_time":start_time, "duration":step_s, "ctime":file_creation_ts_in_unixtime_ms}
+                yield {"output":output, "srt_file":output_file, "start_time":start_time, "duration":chunk_duration_s, "ctime":file_creation_ts_in_unixtime_ms}
             with open(output_file, "r") as f:
                 lines = f.read().strip().split("\n")
                 prompt = lines[-1].strip()
-        start_time += step_s
+        start_time += chunk_duration_s
         if input_duration and start_time >= input_duration:
             running = False
             logging.info(f"Reached end of {input_file} after {start_time} seconds")
@@ -310,7 +332,7 @@ async def live_transcribe(get_birth_time=default_get_birth_time):
     else:
         input_codec = await probe_codec_with_ffmpeg(args.url)
         tmp_live_file = f"/tmp/whisper-local-buffer.{input_codec}"
-        cmdls = gen_ffmpeg_copy_audio_cmd(args.url, tmp_live_file, input_codec, read_input_at_native_frame_rate=True)
+        cmdls = gen_ffmpeg_copy_audio_cmd(args.url, tmp_live_file, read_input_at_native_frame_rate=True)
         background_process = await run_process_background(*cmdls)
 
         while not os.path.exists(tmp_live_file):
