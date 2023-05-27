@@ -14,13 +14,14 @@ import sys
 import argparse
 import time
 import logging
+from typing import List
 
 FFMPEG_CMD_PREFIX = (
     "ffmpeg "
     "-loglevel error "
     "-y "
 )
-FFMPEG_CMD = FFMPEG_CMD_PREFIX + (
+FFMPEG_CONVERT_TO_WAV_CMD = FFMPEG_CMD_PREFIX + (
     "-noaccurate_seek "
     "-i {input_file} "
     "-ar 16000 "
@@ -42,7 +43,23 @@ WHISPER_CMD = (
     "--prompt \"{prompt}\" "
 )
 
-async def run_command(cmd):
+
+def gen_ffmpeg_copy_audio_cmd(input_url_or_file: str, output_file:str, codec:str, read_input_at_native_frame_rate=False, start_time=0, duration=None) -> List[str]:
+    cmdls = FFMPEG_CMD_PREFIX.strip().split(' ') + [
+        "-i",
+        input_url_or_file,
+        "-c:a",
+        codec,
+        "-ss",
+        str(start_time),]
+    if read_input_at_native_frame_rate:
+        cmdls += ["-re"]
+    if duration is not None:
+        cmdls += ["-t", str(duration)]
+    cmdls.append(output_file)
+    return cmdls
+
+async def run_command_unsafe(cmd):
     start_time = time.time()
     process = await asyncio.create_subprocess_shell(
         cmd,
@@ -90,15 +107,17 @@ async def default_get_birth_time(file_path):
         return 0
 
 async def loop(params, get_birth_time=default_get_birth_time):
-
     model = params.get('model')
     whisper_path = params.get('whisper_path')
     input_file = params.get('input_file')
     num_cpu = params.get('num_cpu')
     use_openai_api = params.get('use_openai_api')
     follow_stream = params.get('follow_stream')
-    tmp_wav_file = "/tmp/whisper-live.wav"
+    input_codec = params.get('input_codec')
+    tmp_audio_chunk_file = f"/tmp/whisper-live.{input_codec if use_openai_api else 'wav'}"
     step_s = params.get('step_s')
+    if not step_s:
+        step_s = 60 * 50 if (use_openai_api and (not follow_stream)) else 30
     logging.info(f"json: {json.dumps(params)}")
     start_time = 0
     prompt=""
@@ -112,17 +131,25 @@ async def loop(params, get_birth_time=default_get_birth_time):
             start_time = 0
             prompt = ""
         try:
-            os.remove(tmp_wav_file)
+            os.remove(tmp_audio_chunk_file)
         except OSError:
             pass
-        cmd = FFMPEG_CMD.format(
-            start_time=start_time,
-            duration=step_s,
-            input_file=input_file,
-            output_file=tmp_wav_file
-        )
+        if use_openai_api:
+            cmd = ' '.join(gen_ffmpeg_copy_audio_cmd(
+                input_url_or_file=input_file,
+                output_file=tmp_audio_chunk_file,
+                codec=input_codec,
+                start_time=start_time,
+                duration=step_s))
+        else:
+            cmd = FFMPEG_CONVERT_TO_WAV_CMD.format(
+                start_time=start_time,
+                duration=step_s,
+                input_file=input_file,
+                output_file=tmp_audio_chunk_file
+            )
         try:
-            await run_command(cmd)
+            await run_command_unsafe(cmd)
         except subprocess.CalledProcessError as e:
             if e.stderr.decode().strip().endswith("End of file") or start_time == 0:
                 logging.info(f"Waiting {step_s}s for {input_file} file to get more audio...")
@@ -131,12 +158,12 @@ async def loop(params, get_birth_time=default_get_birth_time):
             else:
                 raise e
 
-        tmp_duration = await run_command(f"ffprobe -i {tmp_wav_file} -show_entries format=duration -v quiet -of csv=p=0")
+        tmp_duration = await run_command_unsafe(f"ffprobe -i {tmp_audio_chunk_file} -show_entries format=duration -v quiet -of csv=p=0")
         try:
             tmp_duration = int(float(tmp_duration))
-            logging.debug(f"Got {tmp_duration} seconds of audio in {tmp_wav_file}")
+            logging.debug(f"Got {tmp_duration} seconds of audio in {tmp_audio_chunk_file}")
         except ValueError:
-            logging.info(f"ffmpeg failed to get duration of {tmp_wav_file}. Got '{tmp_duration}', assuming {0} seconds...")
+            logging.info(f"ffmpeg failed to get duration of {tmp_audio_chunk_file}. Got '{tmp_duration}', assuming {0} seconds...")
             tmp_duration = 0
 
         if tmp_duration < step_s:
@@ -152,7 +179,7 @@ async def loop(params, get_birth_time=default_get_birth_time):
             output_file += ".srt"
             #todo check The audio file to transcribe, in one of these formats: mp3, mp4, mpeg, mpga, m4a, wav, or webm.
             import openai
-            with open(tmp_wav_file, "rb") as f:
+            with open(tmp_audio_chunk_file, "rb") as f:
                 transcript = openai.Audio.transcribe("whisper-1", f, response_format="srt", prompt=prompt)
                 print(transcript)
                 yield {"output": transcript}
@@ -160,12 +187,12 @@ async def loop(params, get_birth_time=default_get_birth_time):
             cmd = WHISPER_CMD.format(
                 model=model,
                 num_cpu=num_cpu,
-                input_file=tmp_wav_file,
+                input_file=tmp_audio_chunk_file,
                 whisper_path=whisper_path,
                 output_file=output_file,
                 prompt=prompt,
             )
-            output = await run_command(cmd)
+            output = await run_command_unsafe(cmd)
             output_file += ".srt"
             if output:
                 yield {"output":output, "srt_file":output_file, "start_time":start_time, "duration":step_s, "ctime":file_creation_ts_in_unixtime_ms}
@@ -197,6 +224,18 @@ def setup_logging(debug=False):
     handler.setFormatter(formatter)
     logging.getLogger().addHandler(handler)
 
+async def probe_codec_with_ffmpeg(url_or_file: str) -> str:
+    codec = (await run_command_unsafe(
+            "ffprobe "
+            "-loglevel error "
+            " -select_streams a:0 "
+            " -show_entries stream=codec_name "
+            " -of default=noprint_wrappers=1:nokey=1 "
+            f" {url_or_file}"
+        )).split("\n")[0].strip()
+    logging.debug("codec: '%s'", codec)
+    return codec
+
 async def live_transcribe(get_birth_time=default_get_birth_time):
     tmp_live_file = None
     background_process = None
@@ -205,27 +244,12 @@ async def live_transcribe(get_birth_time=default_get_birth_time):
     setup_logging(args.verbose)
     logging.info(f"Transcribing {args.url} using model '{args.model}', with {args.step} second steps (press Ctrl+C to stop):\n")
     input_compressed_file = None
+    input_codec = await probe_codec_with_ffmpeg(args.url)
     if os.path.exists(args.url):
         input_compressed_file = args.url
     else:
-        codec = (await run_command(
-            "ffprobe "
-            "-loglevel error "
-            " -select_streams a:0 "
-            " -show_entries stream=codec_name "
-            " -of default=noprint_wrappers=1:nokey=1 "
-            f" {args.url}"
-        )).split("\n")[0].strip()
-        logging.debug("codec: '%s'", codec)
-        tmp_live_file = f"/tmp/whisper-local-buffer.{codec}"
-        cmdls = FFMPEG_CMD_PREFIX.strip().split(' ') + [
-            "-re",
-            "-i",
-            args.url,
-            "-c:a",
-            codec,
-            tmp_live_file
-        ]
+        tmp_live_file = f"/tmp/whisper-local-buffer.{input_codec}"
+        cmdls = gen_ffmpeg_copy_audio_cmd(args.url, tmp_live_file, input_codec, read_input_at_native_frame_rate=True)
         background_process = await run_process_background(*cmdls)
 
         while not os.path.exists(tmp_live_file):
@@ -242,6 +266,7 @@ async def live_transcribe(get_birth_time=default_get_birth_time):
             'num_cpu': args.num_cpu,
             'use_openai_api': args.use_openai_api,
             'follow_stream': args.follow_stream,
+            'input_codec': input_codec,
         }
         async for chunk in loop(params, get_birth_time=get_birth_time):
             yield chunk
