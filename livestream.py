@@ -90,17 +90,21 @@ async def default_get_birth_time(file_path):
         return 0
 
 async def loop(params, get_birth_time=default_get_birth_time):
-    step_s = params.get('step_s')
+
     model = params.get('model')
     whisper_path = params.get('whisper_path')
     input_file = params.get('input_file')
     num_cpu = params.get('num_cpu')
-    logging.info(f"json: {json.dumps(params)}")
+    use_openai_api = params.get('use_openai_api')
+    follow_stream = params.get('follow_stream')
     tmp_wav_file = "/tmp/whisper-live.wav"
+    step_s = params.get('step_s')
+    logging.info(f"json: {json.dumps(params)}")
     start_time = 0
     prompt=""
     old_creation_ts = 0
-    while True:
+    running = True
+    while running:
         file_creation_ts_in_unixtime_ms = await get_birth_time(input_file)
         if file_creation_ts_in_unixtime_ms != old_creation_ts:
             logging.info(f"File {input_file} was modified at {file_creation_ts_in_unixtime_ms}. Reading from beginning...")
@@ -136,41 +140,54 @@ async def loop(params, get_birth_time=default_get_birth_time):
             tmp_duration = 0
 
         if tmp_duration < step_s:
-            logging.info(f"Not enough audio in {input_file} yet. Got {tmp_duration}/{step_s}, waiting {step_s-tmp_duration} seconds...")
-            await asyncio.sleep(step_s - tmp_duration)
-            continue
+            if follow_stream:
+                logging.info(f"Not enough audio in {input_file} yet. Got {tmp_duration}/{step_s}, waiting {step_s-tmp_duration} seconds...")
+                await asyncio.sleep(step_s - tmp_duration)
+                continue
+            else:
+                running = False
 
         output_file = f"/tmp/whisper-live-{start_time}"
-        cmd = WHISPER_CMD.format(
-            model=model,
-            num_cpu=num_cpu,
-            input_file=tmp_wav_file,
-            whisper_path=whisper_path,
-            output_file=output_file,
-            prompt=prompt,
-        )
-        output = await run_command(cmd)
-        output_file += ".srt"
-        if output:
-            yield {"output":output, "srt_file":output_file, "start_time":start_time, "duration":step_s, "ctime":file_creation_ts_in_unixtime_ms}
-        with open(output_file, "r") as f:
-            lines = f.read().strip().split("\n")
-            prompt = lines[-1].strip()
+        if use_openai_api:
+            output_file += ".srt"
+            #todo check The audio file to transcribe, in one of these formats: mp3, mp4, mpeg, mpga, m4a, wav, or webm.
+            import openai
+            with open(tmp_wav_file, "rb") as f:
+                transcript = openai.Audio.transcribe("whisper-1", f, response_format="srt", prompt=prompt)
+                print(transcript)
+                yield {"output": transcript}
+        else:
+            cmd = WHISPER_CMD.format(
+                model=model,
+                num_cpu=num_cpu,
+                input_file=tmp_wav_file,
+                whisper_path=whisper_path,
+                output_file=output_file,
+                prompt=prompt,
+            )
+            output = await run_command(cmd)
+            output_file += ".srt"
+            if output:
+                yield {"output":output, "srt_file":output_file, "start_time":start_time, "duration":step_s, "ctime":file_creation_ts_in_unixtime_ms}
+            with open(output_file, "r") as f:
+                lines = f.read().strip().split("\n")
+                prompt = lines[-1].strip()
         start_time += step_s - 1
 
 def argparser():
     URL = "http://a.files.bbci.co.uk/media/live/manifesto/audio/simulcast/hls/nonuk/sbr_low/ak/bbc_world_service.m3u8"
-    STEP_S = 30
     MODEL = "base.en"
     WHISPER_PATH = "."
     NUM_CPU = 4
     parser = argparse.ArgumentParser(description='Transcribe audio livestream by feeding ffmpeg output to whisper.cpp at regular intervals')
     parser.add_argument('-u', '--url', type=str, default=URL, help='URL of the audio livestream')
-    parser.add_argument('-s', '--step', type=int, default=STEP_S, help='step size in seconds')
+    parser.add_argument('-s', '--step', type=int, default=None, help='step size in seconds, default 30s if not set not using openai. 25mb with openai')
     parser.add_argument('-m', '--model', type=str, default=MODEL, help='model to use for transcription')
     parser.add_argument('-p', '--whisper-path', type=str, default=WHISPER_PATH, help='path to whisper.cpp build')
     parser.add_argument('-v', '--verbose', action='store_true', help='print verbose output')
     parser.add_argument('-n', '--num-cpu', type=int, default=NUM_CPU, help='number of cpus to use')
+    parser.add_argument('--use-openai-api', action='store_true', help='use OpenAI API instead of local whisper.cpp')
+    parser.add_argument('-f', '--follow-stream', action='store_true', help='Continouslly follow web stream or local file (like tail -F)')
     return parser
 
 def setup_logging(debug=False):
@@ -223,6 +240,8 @@ async def live_transcribe(get_birth_time=default_get_birth_time):
             'whisper_path': args.whisper_path,
             'input_file': input_compressed_file,
             'num_cpu': args.num_cpu,
+            'use_openai_api': args.use_openai_api,
+            'follow_stream': args.follow_stream,
         }
         async for chunk in loop(params, get_birth_time=get_birth_time):
             yield chunk
