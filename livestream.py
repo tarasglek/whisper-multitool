@@ -6,6 +6,7 @@ Python implementation by @tarasglek
 ref: https://github.com/ggerganov/whisper.cpp/issues/185
 """
 import asyncio
+import datetime
 import json
 import math
 import os
@@ -173,23 +174,38 @@ async def ffmpeg_get_duration(filename: str):
     duration = int(float(duration))
     return duration
 
+def time_to_seconds(time_obj: datetime.time):
+    return time_obj.hour * 3600 + time_obj.minute * 60 + time_obj.second + time_obj.microsecond / 1e6
 
-def srt_clean_last_said(srt_file):
+def srt_trim_last(srt_file: str, end_of_file_seconds: float):
     """
-    Used to give context from one subtitle chunk to next, remove punctuation to make it easier for model to continue mid-sentence.
-    Also remove punctuation at end of last subtitle chunk to avoid punctuation mid-sentence.
-    save this modified srt file to disk
+    Used to give context from one subtitle chunk to next.  
+    We assume that last thing said in srt was incomplete and overlap that on next iteration of whisper
+    @returns last prompt(that was kept), start_seconds to start next transcription at
     """
-    subs = pysrt.open(srt_file)
-    last = None
-    for sub in reversed(subs):
-        if sub.text.strip():
-            last = sub.text = ''.join(filter(lambda x: not (x in string.punctuation), sub.text))
-            break
-    subs.clean_indexes()
-    subs.save(srt_file, encoding='utf-8')
-    return last
-
+    subs: pysrt.SubRipFile = pysrt.open(srt_file)
+    last_prompt = None
+    start_seconds = end_of_file_seconds
+    end_seconds = end_of_file_seconds
+    if len(subs) > 1:
+        # get time in seconds of start of subtitle
+        last_sub = subs[-1]
+        sub_start_seconds = time_to_seconds(last_sub.start.to_time())
+        sub_end_seconds = time_to_seconds(last_sub.end.to_time())
+        # if last subtitle is more than 1 second before end of file, then we assume it was complete
+        if end_of_file_seconds - end_seconds <= 1:
+            start_seconds = sub_start_seconds
+            end_seconds = sub_end_seconds
+            # remove last subtitle cos we gonna re-transcribe it
+            logging.debug(f"Removing {last_sub.start}-{last_sub.end}{json.dumps(last_sub.text)} from {srt_file} for clean overlap")
+            subs.pop(-1)
+            subs.clean_indexes()
+            subs.save(srt_file, encoding='utf-8')
+    if len(subs) > 0:
+        last_sub = subs[-1]
+        last_prompt = str(last_sub.text)
+    return last_prompt, start_seconds
+    
 def append_srt_file(srt_file_from_0, offset_s, srt_file_to_add):
     """
     use pysrt to append srt_file_to_add to srt_file_from_0 after adjusting timestamps in srt_file_to_add by offset_s
@@ -223,7 +239,7 @@ async def loop(params, get_birth_time=default_get_birth_time):
             chunk_duration_s = input_duration
 
     logging.info(f"json: {json.dumps(params)}")
-    start_time = 0
+    start_time = float(0)
     prompt=""
     old_creation_ts = 0
     running = True
@@ -232,7 +248,7 @@ async def loop(params, get_birth_time=default_get_birth_time):
         if file_creation_ts_in_unixtime_ms != old_creation_ts:
             logging.info(f"File {input_file} was modified at {file_creation_ts_in_unixtime_ms}. Reading from beginning...")
             old_creation_ts = file_creation_ts_in_unixtime_ms
-            start_time = 0
+            start_time = float(0)
             prompt = ""
         try:
             os.remove(tmp_audio_chunk_file)
@@ -254,7 +270,7 @@ async def loop(params, get_birth_time=default_get_birth_time):
         try:
             await run_command_unsafe(cmd)
         except subprocess.CalledProcessError as e:
-            if e.stderr.decode().strip().endswith("End of file") or start_time == 0:
+            if e.stderr.decode().strip().endswith("End of file") or int(start_time) == 0:
                 logging.info(f"Waiting {chunk_duration_s}s for {input_file} file to get more audio...")
                 await asyncio.sleep(chunk_duration_s)
                 continue
@@ -316,8 +332,7 @@ async def loop(params, get_birth_time=default_get_birth_time):
             tmp_output_file += ".srt"
             if output:
                 yield {"output":output, "srt_file":tmp_output_file, "start_time":start_time, "duration":chunk_duration_s, "ctime":file_creation_ts_in_unixtime_ms}
-        prompt = srt_clean_last_said(tmp_output_file)
-        if start_time == 0:
+        if int(start_time) == 0:
             logging.debug(f"Renaming {tmp_output_file} to {output_file}")
             os.rename(tmp_output_file, output_file)
         else:
@@ -326,15 +341,13 @@ async def loop(params, get_birth_time=default_get_birth_time):
             logging.debug(f"Removing {tmp_output_file}")
             os.remove(tmp_output_file)
 
+
         start_time += chunk_duration_s
         if input_duration and (start_time >= input_duration):
             running = False
             logging.info(f"Successfully transcribed {start_time}/{input_duration} seconds of {input_file}")
         else:
-            # overlap transcripts by 1 second to avoid missing words
-            # TODO: calculate overlap based on timestamp of last entry in srt file
-            # start new transcription at same timestamp
-            start_time -= OVERLAP_SECONDS
+            prompt, start_time = srt_trim_last(output_file, start_time)
 
 def argparser():
     URL = "http://a.files.bbci.co.uk/media/live/manifesto/audio/simulcast/hls/nonuk/sbr_low/ak/bbc_world_service.m3u8"
@@ -350,7 +363,7 @@ def argparser():
     parser.add_argument('-n', '--num-cpu', type=int, default=NUM_CPU, help='number of cpus to use')
     parser.add_argument('--use-openai-api', action='store_true', help='use OpenAI API instead of local whisper.cpp')
     parser.add_argument('-f', '--follow-stream', action='store_true', help='Continouslly follow web stream or local file (like tail -F)')
-    parser.add_argument('--output_file', default="transcription.srt", help='output file')
+    parser.add_argument('--output-file', default="transcription.srt", help='output file')
     return parser
 
 def setup_logging(debug=False):
