@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Transcribe audio livestream by feeding ffmpeg output to whisper.cpp at regular intervals
-Idea by @semiformal-net
+Transcribe audio livestream or file by feeding ffmpeg output to whisper.cpp or openai at regular intervals
+
 Python implementation by @tarasglek
-ref: https://github.com/ggerganov/whisper.cpp/issues/185
+inspired by: https://github.com/ggerganov/whisper.cpp/issues/185 https://github.com/ggerganov/whisper.cpp/blob/master/examples/livestream.sh
 """
 import asyncio
 import datetime
@@ -197,7 +197,7 @@ def srt_trim_last(srt_file: str, end_of_file_seconds: float):
             start_seconds = sub_start_seconds
             end_seconds = sub_end_seconds
             # remove last subtitle cos we gonna re-transcribe it
-            logging.debug(f"Removing {last_sub.start}-{last_sub.end}{json.dumps(last_sub.text)} from {srt_file} for clean overlap")
+            logging.debug(f"Removing {last_sub.start}-{last_sub.end}:{json.dumps(last_sub.text)} from {srt_file} for clean overlap")
             subs.pop(-1)
             subs.clean_indexes()
             subs.save(srt_file, encoding='utf-8')

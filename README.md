@@ -8,5 +8,5 @@ micromamba create --name whisper-multitool --channel conda-forge  click
 micromamba activate whisper-multitool
 pip install -r requirements.txt
 
-./livestream.py -u ./samples/Pentagon_documents_leaked_to_social_media_investigation_underway.mp4 --use-openai-api -v
+./whisper-multitool.py -u ./samples/Pentagon_documents_leaked_to_social_media_investigation_underway.mp4 --use-openai-api -v
 ```
