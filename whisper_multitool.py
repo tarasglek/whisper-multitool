@@ -64,7 +64,7 @@ async def extension_for_openai(input_file):
         codec = await probe_codec_with_ffmpeg(input_file)
         if codec == "aac":
             return "m4a"
-        elif codec == "vorbis":
+        elif codec in ["vorbis", "opus"]:
             return "webm"
         else:
             raise RuntimeError(f"Can't determine extension for input file {input_file}, codec: {codec}")
