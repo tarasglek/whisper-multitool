@@ -10,7 +10,6 @@ import datetime
 import json
 import math
 import os
-import string
 import subprocess
 import sys
 import argparse
