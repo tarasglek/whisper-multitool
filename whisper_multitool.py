@@ -52,13 +52,24 @@ WHISPER_CMD = (
 def get_extension(filename):
     return os.path.splitext(filename)[1][1:]
 
-def extension_for_openai(input_file):
+async def extension_for_openai(input_file):
     supported_extensions = ['m4a', 'mp3', 'webm', 'mp4', 'mpga', 'wav', 'mpeg']
     input_extension = get_extension(input_file)
     if input_extension == "mp4":
         return "m4a"
+    elif input_extension == "oga":
+        return "webm"
+    if input_extension == "":
+        # need determine codec
+        codec = await probe_codec_with_ffmpeg(input_file)
+        if codec == "aac":
+            return "m4a"
+        elif codec == "vorbis":
+            return "webm"
+        else:
+            raise RuntimeError(f"Can't determine extension for input file {input_file}, codec: {codec}")
     if input_extension not in supported_extensions:
-        raise RuntimeError(f"Input file extension {input_extension} not supported by OpenAI API. Supported extensions: {supported_extensions}")
+        raise RuntimeError(f"Input file extension '{input_extension}' not supported by OpenAI API. Supported extensions: {supported_extensions}")
     return input_extension
 
 def gen_ffmpeg_copy_audio_cmd(input_url_or_file: str, output_file:str, read_input_at_native_frame_rate=False, start_time=0, duration=None) -> List[str]:
@@ -77,7 +88,7 @@ def gen_ffmpeg_copy_audio_cmd(input_url_or_file: str, output_file:str, read_inpu
     cmdls.append(output_file)
     return cmdls
 
-def gen_ffmpeg_copy_audio_cmd_for_openai(input_url_or_file: str, output_file:str, start_time=0, duration=None) -> List[str]:
+async def gen_ffmpeg_copy_audio_cmd_for_openai(input_url_or_file: str, output_file:str, start_time=0, duration=None) -> List[str]:
     audio_extensions_supported_by_openai = ['m4a', 'mp3', 'mpga', 'wav']
     extension = get_extension(output_file)
     if extension in audio_extensions_supported_by_openai:
@@ -221,7 +232,7 @@ def append_srt_file(srt_file_from_0, offset_s, srt_file_to_add):
     subs_0.clean_indexes()
     subs_0.save(srt_file_from_0, encoding='utf-8')
 
-async def process(params, get_birth_time=default_get_birth_time):
+async def transcribe(params, get_birth_time=default_get_birth_time):
     model = params.get('model')
     whisper_path = params.get('whisper_path')
     input_file = params.get('input_file')
@@ -229,7 +240,7 @@ async def process(params, get_birth_time=default_get_birth_time):
     num_cpu = params.get('num_cpu')
     use_openai_api = params.get('use_openai_api')
     follow_stream = params.get('follow_stream')
-    tmp_audio_chunk_file = f"/tmp/whisper-live.{extension_for_openai(input_file) if use_openai_api else 'wav'}"
+    tmp_audio_chunk_file = f"/tmp/whisper-live.{await extension_for_openai(input_file) if use_openai_api else 'wav'}"
     chunk_duration_s = params.get('step_s')
     input_duration = 0 if follow_stream else await ffmpeg_get_duration(input_file)
     if not chunk_duration_s:
@@ -255,7 +266,7 @@ async def process(params, get_birth_time=default_get_birth_time):
         except OSError:
             pass
         if use_openai_api:
-            cmd = ' '.join(gen_ffmpeg_copy_audio_cmd_for_openai(
+            cmd = ' '.join(await gen_ffmpeg_copy_audio_cmd_for_openai(
                 input_url_or_file=input_file,
                 output_file=tmp_audio_chunk_file,
                 start_time=start_time,
@@ -416,7 +427,7 @@ async def live_transcribe(get_birth_time=default_get_birth_time):
             'follow_stream': args.follow_stream,
             'output_file': args.output_file,
         }
-        async for chunk in process(params, get_birth_time=get_birth_time):
+        async for chunk in transcribe(params, get_birth_time=get_birth_time):
             yield chunk
     finally:
         logging.debug(f"finally: background_process: {background_process}, tmp_live_file: {tmp_live_file}")
@@ -433,7 +444,7 @@ async def live_transcribe(get_birth_time=default_get_birth_time):
 
 async def main():
     async for chunk in live_transcribe():
-        logging.info(chunk["output"])
+        logging.info(chunk)
 
 if __name__ == "__main__":
     try:
