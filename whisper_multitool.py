@@ -221,7 +221,7 @@ def append_srt_file(srt_file_from_0, offset_s, srt_file_to_add):
     subs_0.clean_indexes()
     subs_0.save(srt_file_from_0, encoding='utf-8')
 
-async def loop(params, get_birth_time=default_get_birth_time):
+async def process(params, get_birth_time=default_get_birth_time):
     model = params.get('model')
     whisper_path = params.get('whisper_path')
     input_file = params.get('input_file')
@@ -305,7 +305,7 @@ async def loop(params, get_birth_time=default_get_birth_time):
             else:
                 running = False
 
-        tmp_output_file = f"whisper-live-{start_time}"
+        tmp_output_file = os.path.join(os.path.dirname(output_file), f"whisper-live-{start_time}")
         if use_openai_api:
             tmp_output_file += ".srt"
             import openai
@@ -330,8 +330,6 @@ async def loop(params, get_birth_time=default_get_birth_time):
             )
             output = await run_command_unsafe(cmd)
             tmp_output_file += ".srt"
-            if output:
-                yield {"output":output, "srt_file":tmp_output_file, "start_time":start_time, "duration":chunk_duration_s, "ctime":file_creation_ts_in_unixtime_ms}
         if int(start_time) == 0:
             logging.debug(f"Renaming {tmp_output_file} to {output_file}")
             os.rename(tmp_output_file, output_file)
@@ -348,6 +346,7 @@ async def loop(params, get_birth_time=default_get_birth_time):
             logging.info(f"Successfully transcribed {start_time}/{input_duration} seconds of {input_file}")
         else:
             prompt, start_time = srt_trim_last(output_file, start_time)
+        yield {"output_file": output_file, "end_time_s": start_time, "duration_s": input_duration}
 
 def argparser():
     URL = "http://a.files.bbci.co.uk/media/live/manifesto/audio/simulcast/hls/nonuk/sbr_low/ak/bbc_world_service.m3u8"
@@ -417,7 +416,7 @@ async def live_transcribe(get_birth_time=default_get_birth_time):
             'follow_stream': args.follow_stream,
             'output_file': args.output_file,
         }
-        async for chunk in loop(params, get_birth_time=get_birth_time):
+        async for chunk in process(params, get_birth_time=get_birth_time):
             yield chunk
     finally:
         logging.debug(f"finally: background_process: {background_process}, tmp_live_file: {tmp_live_file}")
